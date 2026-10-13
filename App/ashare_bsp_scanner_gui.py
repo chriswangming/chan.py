@@ -7,7 +7,10 @@ A股缠论买点扫描器 - Powered by chan.py
     - 可视化显示K线、笔、线段、中枢、买卖点、MACD等
 
 数据来源:
-    - 使用 akshare 获取A股实时行情和历史K线数据
+    - 股票列表: akshare 的东财实时行情（stock_zh_a_spot_em）
+    - 历史K线: 腾讯财经 fqkline 接口直连（httpx），不经过 akshare。
+      逻辑参考 stock-chanlun/backend/services/akshare_service.py 的 get_kline_hist，
+      单次约 0.2s（akshare 东财接口约 3~5s），扫描全市场时是数量级的差距。
 
 过滤规则:
     - 剔除ST股票、科创板(688)、北交所、B股
@@ -28,7 +31,15 @@ from pathlib import Path
 # 将项目根目录加入路径，以便导入 chan.py 核心模块
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import json
+import re
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+
+import httpx
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -102,6 +113,305 @@ def get_tradable_stocks():
         return pd.DataFrame()
 
 
+# ══════════════════════════════════════════════════════════════════
+#  K线获取 —— 腾讯财经 fqkline 直连
+#
+#  接口、代码规范化与返回体解析都对齐 stock-chanlun/backend/services/
+#  akshare_service.py 的 get_kline_hist；差别在于缓存：那里是全站共享的
+#  进程级缓存，这里只留最近 64 只（全市场扫描是一次性遍历，大缓存只会吃内存），
+#  够「单只分析」反复点同一只股票时复用即可。
+#
+#  为什么不继续用 akshare：DATA_SRC.AKSHARE 走东财 stock_zh_a_hist，单次约
+#  3~5s，扫 5000 只需要数小时；腾讯这个接口单次约 0.2s，且 httpx 显式
+#  trust_env=False，不吃本机代理环境变量，不会偶发 ProxyError。
+# ══════════════════════════════════════════════════════════════════
+
+# chan.py 的 CSV 数据源固定读 {项目根}/{code}_{周期}.csv（见 DataAPI/csvAPI.py）
+CHAN_ROOT = Path(__file__).resolve().parent.parent
+
+_QQ_PERIOD = {"daily": "day", "weekly": "week", "monthly": "month"}
+_QQ_ADJUST = {"qfq": "qfq", "hfq": "hfq", "": "", None: ""}
+
+_http_client: httpx.Client | None = None
+_http_client_lock = threading.RLock()
+
+# 小容量 TTL 缓存：key=(code, period, adjust, limit)
+_kline_cache: OrderedDict = OrderedDict()
+_kline_cache_lock = threading.RLock()
+_KLINE_CACHE_MAX = 64
+_KLINE_CACHE_TTL = 300  # 秒
+
+
+def _cache_get(key):
+    with _kline_cache_lock:
+        entry = _kline_cache.get(key)
+        if entry is None:
+            return None
+        df, ts = entry
+        if time.time() - ts < _KLINE_CACHE_TTL:
+            _kline_cache.move_to_end(key)
+            return df
+        _kline_cache.pop(key, None)
+        return None
+
+
+def _cache_put(key, df):
+    with _kline_cache_lock:
+        _kline_cache[key] = (df, time.time())
+        _kline_cache.move_to_end(key)
+        while len(_kline_cache) > _KLINE_CACHE_MAX:
+            _kline_cache.popitem(last=False)
+
+
+def _get_client() -> httpx.Client:
+    """共享 httpx 客户端：trust_env=False 绕开代理，连接池复用。"""
+    global _http_client
+    with _http_client_lock:
+        if _http_client is None:
+            _http_client = httpx.Client(
+                timeout=15.0,
+                follow_redirects=True,
+                trust_env=False,  # 关键：不吃 HTTP_PROXY/HTTPS_PROXY 环境变量
+                limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+                headers={
+                    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/120.0.0.0 Safari/537.36"),
+                    "Referer": "https://finance.qq.com/",
+                    "Accept": "*/*",
+                },
+            )
+        return _http_client
+
+
+def normalize_stock_code(code: str) -> tuple[str, str]:
+    """规范化股票代码，返回 (6位代码, 交易所 sz/sh/bj)。"""
+    code = str(code).strip().zfill(6)
+    if code.startswith(("00", "30", "002", "003")):
+        return code, "sz"
+    if code.startswith(("60", "68", "500", "501")):
+        return code, "sh"
+    if code.startswith(("8", "4")):
+        return code, "bj"
+    return code, "sz"
+
+
+def get_kline_hist(
+    code: str,
+    period: str = "daily",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    adjust: str = "qfq",
+    limit: int = 500,
+    retry: int = 2,
+) -> pd.DataFrame:
+    """
+    获取A股历史K线（腾讯财经 fqkline 直连）。
+
+    Args:
+        code: 股票代码，如 '000001' / 'sh600000'
+        period: daily / weekly / monthly
+        start_date / end_date: 'YYYY-MM-DD'，在此区间内裁剪（含端点）
+        adjust: qfq 前复权 / hfq 后复权 / '' 不复权
+        limit: 最多取多少根（腾讯按最近 N 根返回，上限约 2000）
+        retry: 失败重试次数
+
+    Returns:
+        pd.DataFrame: 列 [date, open, close, high, low, volume]，date 为 datetime64；
+                      失败或无数据时返回空 DataFrame（不抛异常，便于扫描逐只容错）。
+    """
+    limit = max(20, min(int(limit), 2000))
+    adjust = _QQ_ADJUST.get(adjust, "qfq")
+    sym, mkt = normalize_stock_code(code)
+    period_qq = _QQ_PERIOD.get(period, "day")
+
+    cache_key = (sym, period_qq, adjust, limit)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+           f"?_var=kline_{period_qq}{adjust}&param={mkt}{sym},{period_qq},,,{limit},{adjust}")
+
+    text = None
+    last_err = None
+    for attempt in range(retry + 1):
+        try:
+            resp = _get_client().get(url)
+            text = resp.text
+            break
+        except Exception as e:      # 网络抖动：退避后重试
+            last_err = e
+            time.sleep(0.3 * (attempt + 1))
+    if text is None:
+        print(f"K线获取失败 {code}: {last_err}")
+        return pd.DataFrame()
+
+    # 返回体形如 kline_dayqfq={...}
+    json_match = re.search(r"=({.+})", text)
+    if not json_match:
+        return pd.DataFrame()
+    try:
+        payload = json.loads(json_match.group(1))
+    except json.JSONDecodeError:
+        return pd.DataFrame()
+
+    key = f"{mkt}{sym}"
+    node = payload.get("data", {}).get(key)
+    if not node:
+        return pd.DataFrame()
+
+    # 复权数据的键名不固定（实测是 qfqday 而不是 dayqfq），逐个试
+    klines = node.get(f"{period_qq}{adjust}", [])
+    if not klines:
+        for k in (f"{adjust}{period_qq}", f"{period_qq}{adjust}", period_qq, "day",
+                  "qfqday", "hfqday", "dayqfq", "dayhfq"):
+            if node.get(k):
+                klines = node[k]
+                break
+    if not klines:
+        return pd.DataFrame()
+
+    records = []
+    for kl in klines:
+        if len(kl) < 6:
+            continue
+        try:
+            records.append({
+                "date": kl[0],
+                "open": float(kl[1]),
+                "close": float(kl[2]),
+                "high": float(kl[3]),
+                "low": float(kl[4]),
+                "volume": float(kl[5]),
+            })
+        except (ValueError, IndexError):
+            continue
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    df["date"] = pd.to_datetime(df["date"])
+    if start_date:
+        df = df[df["date"] >= pd.Timestamp(start_date)]
+    if end_date:
+        df = df[df["date"] <= pd.Timestamp(end_date)]
+    if len(df) > limit:
+        df = df.tail(limit)
+    df = df.reset_index(drop=True)
+
+    _cache_put(cache_key, df)
+    return df
+
+
+def save_klines_to_csv(code: str, df: pd.DataFrame, k_type: str = "day") -> Path:
+    """
+    按 chan.py CSV_API 的约定把K线写成 {项目根}/{code}_{k_type}.csv。
+
+    CSV_API 只认 5 列（time,open,high,low,close），且跳过首行表头；日期必须是
+    'YYYY-MM-DD'（它按长度 10 解析）。列多一个少一个都会抛 SRC_DATA_FORMAT_ERROR。
+    """
+    path = CHAN_ROOT / f"{code}_{k_type}.csv"
+    sub = df[["date", "open", "high", "low", "close"]].copy()
+    sub["date"] = pd.to_datetime(sub["date"]).dt.strftime("%Y-%m-%d")
+    sub.to_csv(path, index=False)
+    return path
+
+
+# CSV 的文件名是按 code 写死的（{code}_day.csv），所以：
+#   · 同一只股票必须串行：两个线程同时分析它会互相覆盖/提前删除文件
+#   · 不同股票之间完全并行，锁只保护「写文件」「删文件」这两个瞬时操作，
+#     最耗时的缠论计算留在锁外，线程池才有意义
+_csv_lock = threading.RLock()
+_inflight_codes: set[str] = set()
+_inflight_cv = threading.Condition()
+
+_AUTYPE_ADJUST = {
+    AUTYPE.QFQ: "qfq",
+    AUTYPE.HFQ: "hfq",
+    AUTYPE.NONE: "",
+}
+
+
+def _acquire_code(code: str):
+    """串行化同一只股票的 build_chan（不同股票不互相阻塞）。"""
+    with _inflight_cv:
+        while code in _inflight_codes:
+            _inflight_cv.wait()
+        _inflight_codes.add(code)
+
+
+def _release_code(code: str):
+    with _inflight_cv:
+        _inflight_codes.discard(code)
+        _inflight_cv.notify_all()
+
+
+def build_chan(
+    code: str,
+    config,
+    begin_time: str | None = None,
+    end_time: str | None = None,
+    days: int = 365,
+    autype: AUTYPE = AUTYPE.QFQ,
+    lv_list: list | None = None,
+) -> CChan:
+    """
+    拉取K线并用它构造 CChan。
+
+    走 DATA_SRC.CSV：先把腾讯拿到的K线写成 chan.py 约定的临时 CSV，
+    交给 CChan 读完再删掉。这样绕开 DATA_SRC.AKSHARE，
+    但缠论计算本身完全不变（同一套 CSV_API 输入）。
+
+    Raises:
+        ValueError: 拿不到K线数据（调用方按「无数据」处理）
+    """
+    lv_list = lv_list or [KL_TYPE.K_DAY]
+    k_type = lv_list[0].name[2:].lower()       # KL_TYPE.K_DAY -> 'day'
+    adjust = _AUTYPE_ADJUST.get(autype, "qfq")
+    if begin_time is None:
+        begin_time = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    if end_time is None:
+        end_time = datetime.now().strftime("%Y-%m-%d")
+
+    # 按交易日折算根数（一年约 250 个交易日），多取一些让 begin_time 过滤后仍够长
+    limit = max(60, int(days * 250 / 365) + 30)
+
+    df = get_kline_hist(code, period="daily", start_date=begin_time,
+                        end_date=end_time, adjust=adjust, limit=limit)
+    if df.empty:
+        raise ValueError(f"{code} 无K线数据")
+
+    _acquire_code(code)
+    try:
+        with _csv_lock:
+            path = save_klines_to_csv(code, df, k_type=k_type)
+        try:
+            return CChan(
+                code=code,
+                begin_time=begin_time,
+                end_time=end_time,
+                data_src=DATA_SRC.CSV,
+                lv_list=lv_list,
+                config=config,
+                autype=autype,
+            )
+        finally:
+            with _csv_lock:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    finally:
+        _release_code(code)
+
+
+# 扫描并发数：K线下载是IO、缠论计算受 GIL 制约，8~12 之间性价比最高，
+# 再往上腾讯接口和 CPU 都会成为瓶颈
+DEFAULT_SCAN_WORKERS = 8
+
+
 class ScanThread(QThread):
     """
     批量扫描股票的后台线程
@@ -120,7 +430,7 @@ class ScanThread(QThread):
     finished = pyqtSignal(int, int)
     log_signal = pyqtSignal(str)
 
-    def __init__(self, stock_list, config, days=365):
+    def __init__(self, stock_list, config, days=365, workers=DEFAULT_SCAN_WORKERS):
         """
         初始化扫描线程
 
@@ -128,11 +438,13 @@ class ScanThread(QThread):
             stock_list: pd.DataFrame, 待扫描的股票列表
             config: CChanConfig, 缠论配置
             days: int, 获取多少天的历史数据，默认365天
+            workers: int, 并发线程数，默认 DEFAULT_SCAN_WORKERS
         """
         super().__init__()
         self.stock_list = stock_list
         self.config = config
         self.days = days
+        self.workers = max(1, int(workers))
         self.is_running = True
 
     def stop(self):
@@ -141,13 +453,19 @@ class ScanThread(QThread):
 
     def run(self):
         """
-        线程主函数，遍历股票列表进行缠论分析
+        线程主函数：用线程池并发扫描股票列表
 
-        扫描逻辑:
+        每只股票的处理逻辑（在 worker 里跑）:
             1. 跳过无K线数据的股票
             2. 跳过停牌超过15天的股票
             3. 检测最近3天内是否出现买点
             4. 发现买点时通过 found_signal 发出通知
+
+        并发说明:
+            K线下载是网络IO、缠论计算是CPU，两者交替，实测 8 个 worker 能到
+            3~4 倍加速（再往上受 GIL 与腾讯接口限制收益递减）。
+            同一只股票内部由 build_chan 串行保护，不会自己踩自己。
+            点「停止」后不再派新任务，已在跑的最多再跑完当前这一批。
         """
         begin_time = (datetime.now() - timedelta(days=self.days)).strftime("%Y-%m-%d")
         end_time = datetime.now().strftime("%Y-%m-%d")
@@ -155,68 +473,107 @@ class ScanThread(QThread):
         success_count = 0
         fail_count = 0
 
-        for idx, row in self.stock_list.iterrows():
+        rows = [(r['代码'], r['名称'], r['最新价'], r['涨跌幅'])
+                for _, r in self.stock_list.iterrows()]
+
+        def scan_one(item):
+            """处理一只股票，返回结构化结果（不碰信号，交给主线程统一 emit）。
+
+            已停止时返回 None：让「还没轮到的」任务立刻空转返回，
+            run() 才能尽快收尾（正在跑的那批最多再跑完自己这一只）。
+            """
+            code, name, price, change = item
             if not self.is_running:
-                break
-
-            code = row['代码']
-            name = row['名称']
-            self.progress.emit(idx + 1, total, f"{code} {name}")
-            self.log_signal.emit(f"🔍 扫描 {code} {name}...")
-
+                return None
             try:
-                chan = CChan(
+                chan = build_chan(
                     code=code,
+                    config=self.config,
                     begin_time=begin_time,
                     end_time=end_time,
-                    data_src=DATA_SRC.AKSHARE,
-                    lv_list=[KL_TYPE.K_DAY],
-                    config=self.config,
-                    autype=AUTYPE.QFQ,
+                    days=self.days,
                 )
-
-                # 检查最近15天是否有数据
-                if len(chan[0]) == 0:
-                    fail_count += 1
-                    self.log_signal.emit(f"⏭️ {code} {name}: 无K线数据")
-                    continue
-                last_klu = chan[0][-1][-1]
-                last_time = last_klu.time
-                last_date = datetime(last_time.year, last_time.month, last_time.day)
-                if (datetime.now() - last_date).days > 15:
-                    fail_count += 1
-                    self.log_signal.emit(f"⏸️ {code} {name}: 停牌超过15天")
-                    continue
-
-                success_count += 1
-
-                # 检查是否有买点（只找最近3天内出现的买点）
-                bsp_list = chan.get_latest_bsp(number=0)
-                cutoff_date = datetime.now() - timedelta(days=3)
-                buy_points = [
-                    bsp for bsp in bsp_list
-                    if bsp.is_buy and datetime(bsp.klu.time.year, bsp.klu.time.month, bsp.klu.time.day) >= cutoff_date
-                ]
-
-                if buy_points:
-                    # 获取最近的买点
-                    latest_buy = buy_points[0]
-                    self.log_signal.emit(f"✅ {code} {name}: 发现买点 {latest_buy.type2str()}")
-                    self.found_signal.emit({
-                        'code': code,
-                        'name': name,
-                        'price': row['最新价'],
-                        'change': row['涨跌幅'],
-                        'bsp_type': latest_buy.type2str(),
-                        'bsp_time': str(latest_buy.klu.time),
-                        'chan': chan,
-                    })
-                else:
-                    self.log_signal.emit(f"➖ {code} {name}: 无近期买点")
             except Exception as e:
-                fail_count += 1
-                self.log_signal.emit(f"❌ {code} {name}: {str(e)[:50]}")
-                continue
+                return {'status': 'fail', 'code': code, 'name': name,
+                        'msg': f"❌ {code} {name}: {str(e)[:50]}"}
+
+            # 检查最近15天是否有数据
+            if len(chan[0]) == 0:
+                return {'status': 'fail', 'code': code, 'name': name,
+                        'msg': f"⏭️ {code} {name}: 无K线数据"}
+            last_klu = chan[0][-1][-1]
+            last_time = last_klu.time
+            last_date = datetime(last_time.year, last_time.month, last_time.day)
+            if (datetime.now() - last_date).days > 15:
+                return {'status': 'fail', 'code': code, 'name': name,
+                        'msg': f"⏸️ {code} {name}: 停牌超过15天"}
+
+            # 检查是否有买点（只找最近3天内出现的买点）
+            bsp_list = chan.get_latest_bsp(number=0)
+            cutoff_date = datetime.now() - timedelta(days=3)
+            buy_points = [
+                bsp for bsp in bsp_list
+                if bsp.is_buy and datetime(bsp.klu.time.year, bsp.klu.time.month, bsp.klu.time.day) >= cutoff_date
+            ]
+
+            if buy_points:
+                # 获取最近的买点
+                latest_buy = buy_points[0]
+                return {
+                    'status': 'ok', 'code': code, 'name': name,
+                    'price': price, 'change': change,
+                    'msg': f"✅ {code} {name}: 发现买点 {latest_buy.type2str()}",
+                    'bsp_type': latest_buy.type2str(),
+                    'bsp_time': str(latest_buy.klu.time),
+                    'chan': chan,
+                }
+            return {'status': 'ok', 'code': code, 'name': name,
+                    'msg': f"➖ {code} {name}: 无近期买点"}
+
+        done = 0
+        workers = max(1, min(self.workers, max(len(rows), 1)))
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="scan") as pool:
+            futures = [pool.submit(scan_one, r) for r in rows]
+            try:
+                for fut in as_completed(futures):
+                    if not self.is_running:
+                        break
+                    try:
+                        res = fut.result()
+                    except Exception as e:      # worker 内未覆盖的异常，不能让整个扫描挂掉
+                        fail_count += 1
+                        done += 1
+                        self.log_signal.emit(f"❌ 分析异常: {str(e)[:60]}")
+                        continue
+
+                    if res is None:             # 停止后被跳过的任务，不计入统计
+                        continue
+
+                    done += 1
+                    self.progress.emit(done, total, f"{res['code']} {res['name']}")
+                    self.log_signal.emit(res['msg'])
+
+                    if res['status'] == 'fail':
+                        fail_count += 1
+                        continue
+
+                    success_count += 1
+                    if res.get('bsp_type'):
+                        self.found_signal.emit({
+                            'code': res['code'],
+                            'name': res['name'],
+                            'price': res['price'],
+                            'change': res['change'],
+                            'bsp_type': res['bsp_type'],
+                            'bsp_time': res['bsp_time'],
+                            'chan': res['chan'],
+                        })
+            finally:
+                # 停止后撤掉还没开始的任务，避免后台空跑
+                if not self.is_running:
+                    for f in futures:
+                        f.cancel()
 
         self.finished.emit(success_count, fail_count)
 
@@ -254,14 +611,12 @@ class SingleAnalysisThread(QThread):
             begin_time = (datetime.now() - timedelta(days=self.days)).strftime("%Y-%m-%d")
             end_time = datetime.now().strftime("%Y-%m-%d")
 
-            chan = CChan(
+            chan = build_chan(
                 code=self.code,
+                config=self.config,
                 begin_time=begin_time,
                 end_time=end_time,
-                data_src=DATA_SRC.AKSHARE,
-                lv_list=[KL_TYPE.K_DAY],
-                config=self.config,
-                autype=AUTYPE.QFQ,
+                days=self.days,
             )
             self.finished.emit(chan)
         except Exception as e:

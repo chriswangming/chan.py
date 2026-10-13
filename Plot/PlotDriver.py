@@ -15,6 +15,22 @@ from Math.Demark import T_DEMARK_INDEX, CDemarkEngine
 from .PlotMeta import CBi_meta, CChanPlotMeta, CZS_meta
 
 
+def get_colormap(name: str = "hsv", n: int = 10):
+    """
+    取离散 colormap，兼容 matplotlib 各版本
+
+    matplotlib 3.9 移除（3.7 起弃用）了 `plt.cm.get_cmap()`，改用 `matplotlib.colormaps`
+    注册表；旧版本则回落到 `matplotlib.cm.get_cmap()`。
+    """
+    try:  # matplotlib >= 3.5
+        from matplotlib import colormaps
+        base = colormaps[name]
+        return base.resampled(n) if hasattr(base, "resampled") else base
+    except (ImportError, KeyError):  # pragma: no cover - matplotlib < 3.5
+        import matplotlib.cm as cm
+        return cm.get_cmap(name, n)
+
+
 def reformat_plot_config(plot_config: Dict[str, bool]):
     """
     兼容不填写`plot_`前缀的情况
@@ -556,7 +572,7 @@ class CPlotDriver:
     def draw_mean(self, meta: CChanPlotMeta, ax: Axes):
         mean_lst = [klu.trend[TREND_TYPE.MEAN] for klu in meta.klu_iter()]
         Ts = list(mean_lst[0].keys())
-        cmap = plt.cm.get_cmap('hsv', max([10, len(Ts)]))  # type: ignore
+        cmap = get_colormap('hsv', max([10, len(Ts)]))
         for cmap_idx, T in enumerate(Ts):
             mean_arr = [mean_dict[T] for mean_dict in mean_lst]
             ax.plot(range(len(mean_arr)), mean_arr, c=cmap(cmap_idx), label=f'{T} meanline')
