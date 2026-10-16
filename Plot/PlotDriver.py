@@ -1,4 +1,6 @@
 import inspect
+import json
+from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
@@ -169,6 +171,192 @@ def GetPlotMeta(chan: CChan, figure_config) -> List[CChanPlotMeta]:
     return plot_metas
 
 
+def _json_num(v, round_digits: Optional[int]) -> float:
+    """
+    把价格转成 JSON 友好的 float。
+
+    Args:
+        v: 待转换的价格（通常是 float，也可能是 numpy 标量）
+        round_digits: 保留小数位；None 表示不做任何舍入
+
+    Returns:
+        float
+
+    Note:
+        默认**不四舍五入**是有意的：这份 JSON 的用途是跨项目比对计算结果，
+        提前舍入会把真实的精度差异（比如 0.000001 级别）抹掉，反而查不出问题。
+        只想看个大概或要减小文件体积时再显式传 round_digits（常用 2~4）。
+    """
+    num = float(v)
+    return round(num, round_digits) if round_digits is not None else num
+
+
+def _json_enum_name(v) -> str:
+    """
+    把枚举输出成可读字符串（如 ``FX_TYPE.TOP`` -> ``"TOP"``），非枚举退化为 ``str(v)``。
+    """
+    return v.name if hasattr(v, "name") else str(v)
+
+
+def get_plot_lv_data(meta: CChanPlotMeta, round_digits: Optional[int] = None) -> Dict:
+    """
+    把**单一级别**的三种画图数据序列化成可直接 ``json.dump`` 的字典。
+
+    分别对应三个画图开关（见 ``CPlotDriver.DrawElement``）:
+
+        - ``kline``          —— ``plot_kline``：原始K线（未经包含处理的 KLU）
+        - ``kline_combine``  —— ``plot_kline_combine``：包含处理后的合并K线（KLC）
+        - ``bi``             —— ``plot_bi``：笔
+
+    Args:
+        meta: 该级别的画图元数据（``CChanPlotMeta``）
+        round_digits: 价格保留小数位，None 表示不处理
+
+    Returns:
+        Dict: 形如 ``{"count": {...}, "kline": [...], "kline_combine": [...], "bi": [...]}``
+
+    Note:
+        - 与画图不同，这里**不裁剪 x_range**：导出的是完整计算结果，
+          方便其它项目在自己的窗口/截断逻辑下逐项比对。
+        - ``kline_combine`` 里的 ``klu_idx_list`` 就是包含关系的明细：
+          它记录了这根合并K线吃掉了哪些原始K线（含首根），凭它可以校验
+          「合并不丢原始K线」——即所有 list 长度之和应等于原始K线总数。
+        - 坐标口径统一用 KLU 在本级别的下标 ``idx``（不是日期字符串），
+          所以 ``bi`` 的 ``begin_x/end_x`` 可以直接当 ``kline`` 的数组下标用。
+    """
+    kline = [
+        {
+            "idx": int(klu.idx),
+            "time": klu.time.to_str(),
+            "open": _json_num(klu.open, round_digits),
+            "high": _json_num(klu.high, round_digits),
+            "low": _json_num(klu.low, round_digits),
+            "close": _json_num(klu.close, round_digits),
+        }
+        for klu in meta.klu_iter()
+    ]
+    kline_combine = [
+        {
+            "begin_idx": int(klc.begin_idx),
+            "end_idx": int(klc.end_idx),
+            "high": _json_num(klc.high, round_digits),
+            "low": _json_num(klc.low, round_digits),
+            # 值为 FX_TYPE.TOP/BOTTOM 表示这根K线本身是分型；
+            # 为 KLINE_DIR.UP/DOWN 则是普通合并K线，标记的是合并方向
+            "type": _json_enum_name(klc.type),
+            "klu_cnt": len(klc.klu_list),
+            "klu_idx_list": [int(klu.idx) for klu in klc.klu_list],
+        }
+        for klc in meta.klc_list
+    ]
+    bi = [
+        {
+            "idx": int(bi_meta.idx),
+            "dir": _json_enum_name(bi_meta.dir),
+            "type": _json_enum_name(bi_meta.type),
+            "is_sure": bool(bi_meta.is_sure),
+            "begin_x": int(bi_meta.begin_x),
+            "end_x": int(bi_meta.end_x),
+            "begin_y": _json_num(bi_meta.begin_y, round_digits),
+            "end_y": _json_num(bi_meta.end_y, round_digits),
+        }
+        for bi_meta in meta.bi_list
+    ]
+    return {
+        "count": {
+            "kline": len(kline),
+            "kline_combine": len(kline_combine),
+            "bi": len(bi),
+        },
+        "kline": kline,
+        "kline_combine": kline_combine,
+        "bi": bi,
+    }
+
+def save_plot_data_to_json(
+    chan: CChan,
+    save_dir: Union[str, Path, None] = None,
+    file_name: Optional[str] = None,
+    lv_list: Optional[List[KL_TYPE]] = None,
+    round_digits: Optional[int] = None,
+    indent: int = 2,
+) -> str:
+    """
+    把某只股票的「原始K线 / 合并K线 / 笔」三份画图数据导出到一个 JSON 文件。
+
+    用途：给其它项目（如 stock-chanlun）做**逐项对比**用。那边算出包含合并、
+    分型、笔之后，可以直接按 idx 对齐这里的 ``kline`` / ``kline_combine`` / ``bi``
+    三个数组，从而确认两边算法是否一致，不必靠肉眼看图。
+
+    Args:
+        chan: 已算完的 :class:`CChan`（要取的级别必须已经在 ``chan.lv_list`` 里）
+        save_dir: 输出目录；**默认为本文件所在目录**（即 ``Plot/``）。不存在时自动创建
+        file_name: 文件名；默认为 ``{code}.json``（非法文件名字符会被替换成 ``_``）
+        lv_list: 要导出的级别；None 表示导出 ``chan.lv_list`` 的全部级别
+        round_digits: 价格保留小数位，None 表示不做舍入（推荐，见 :func:`_json_num` 说明）
+        indent: JSON 缩进；传 None 可压成一行以减小体积
+
+    Returns:
+        str: 实际写入的文件绝对路径。
+
+    Raises:
+        CChanException: ``lv_list`` 里出现了 chan 没有计算过的级别（ErrCode.PLOT_ERR）
+
+    输出结构::
+
+        {
+          "code": "sz.000001",
+          "lv_list": ["K_DAY"],
+          "data": {
+            "K_DAY": {
+              "count": {"kline": 300, "kline_combine": 199, "bi": 29},
+              "kline":         [{"idx":0, "time":"2024/01/01", "open":.., "high":.., "low":.., "close":..}, ...],
+              "kline_combine": [{"begin_idx":0, "end_idx":1, "high":.., "low":.., "type":"UP",
+                                 "klu_cnt":2, "klu_idx_list":[0,1]}, ...],
+              "bi":            [{"idx":0, "dir":"UP", "type":"STRICT", "is_sure":true,
+                                 "begin_x":0, "end_x":5, "begin_y":.., "end_y":..}, ...]
+            }
+          }
+        }
+
+    Note:
+        - 三个数组里的坐标都是**本级别 KLU 下标**，可以直接互相当数组下标索引；
+        - ``kline_combine[*].klu_idx_list`` 长度之和 == ``kline`` 长度，
+          这是校验「包含处理有没有吞掉原始K线」最简单的不变量；
+        - 自洽性检查：每条笔的 ``begin_x/end_x`` 应等于相邻两个分型K线的端点，
+          且 ``begin_y/end_y`` 一定能在这两个下标的 ``kline`` 里找到。
+    """
+    target_lv_list = list(lv_list) if lv_list is not None else list(chan.lv_list)
+    for lv in target_lv_list:
+        if lv not in chan.lv_list:
+            raise CChanException(
+                f"lv={lv.name} is not calculated in this CChan, available={[_lv.name for _lv in chan.lv_list]}",
+                ErrCode.PLOT_ERR,
+            )
+
+    data: Dict[str, Dict] = {}
+    for lv in target_lv_list:
+        data[lv.name] = get_plot_lv_data(CChanPlotMeta(chan[lv]), round_digits)
+
+    payload = {
+        "code": chan.code,
+        "lv_list": [lv.name for lv in target_lv_list],
+        "data": data,
+    }
+
+    dir_path = Path(save_dir) if save_dir is not None else Path(__file__).resolve().parent
+    dir_path.mkdir(parents=True, exist_ok=True)
+
+    if file_name is None:
+        safe_code = ''.join(c if c not in '\\/:*?"<>|' else '_' for c in str(chan.code))
+        file_name = f"{safe_code or 'chan'}.json"
+    target = dir_path / file_name
+
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=indent)
+    return str(target)
+
+
 class CPlotDriver:
     def __init__(self, chan: CChan, plot_config: Union[str, dict, list] = '', plot_para=None):
         if plot_para is None:
@@ -218,6 +406,8 @@ class CPlotDriver:
                     srange_begin = meta.sub_range_start_idx(x_range)
 
             ax.set_ylim(self.y_min, self.y_max)
+
+        save_plot_data_to_json(chan)
 
     def GetRealXrange(self, figure_config, meta: CChanPlotMeta):
         x_range = figure_config.get("x_range", 0)
