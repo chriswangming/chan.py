@@ -523,21 +523,21 @@ class CChan:
         else:
             raise CChanException("unspoourt query type", ErrCode.COMMON_ERROR)
 
-    def get_bsp(self, idx=None) -> List[CBS_Point]:
-        """
-        [已废弃] 请改用 get_latest_bsp。
+    # def get_bsp(self, idx=None) -> List[CBS_Point]:
+    #     """
+    #     [已废弃] 请改用 get_latest_bsp。
 
-        Args:
-            idx: 指定级别（KL_TYPE 或下标）；None 时要求只有一个级别
+    #     Args:
+    #         idx: 指定级别（KL_TYPE 或下标）；None 时要求只有一个级别
 
-        Returns:
-            List[CBS_Point]: 按时间排序的买卖点列表
-        """
-        print('[deprecated] use get_latest_bsp instead')
-        if idx is not None:
-            return self[idx].bs_point_lst.getSortedBspList()
-        assert len(self.lv_list) == 1
-        return self[0].bs_point_lst.getSortedBspList()
+    #     Returns:
+    #         List[CBS_Point]: 按时间排序的买卖点列表
+    #     """
+    #     print('[deprecated] use get_latest_bsp instead')
+    #     if idx is not None:
+    #         return self[idx].bs_point_lst.getSortedBspList()
+    #     assert len(self.lv_list) == 1
+    #     return self[0].bs_point_lst.getSortedBspList()
 
     def get_latest_bsp(self, idx=None, number=1) -> List[CBS_Point]:
         """

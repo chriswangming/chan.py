@@ -7,6 +7,7 @@ from Chan import CChan
 from ChanConfig import CChanConfig
 from Common.CEnum import AUTYPE, BSP_TYPE, DATA_SRC, FX_TYPE, KL_TYPE
 from DataAPI.BaoStockAPI import CBaoStock
+from DataAPI.FutuAPI import CFutu
 
 if __name__ == "__main__":
     """
@@ -14,15 +15,15 @@ if __name__ == "__main__":
     只用做展示如何自己实现策略，做回测用~
     相比于strategy_demo.py，本代码演示如何从CChan外部喂K线来触发内部缠论计算
     """
-    code = "sh.600519"
-    begin_time = "2026-01-01"
+    code = "00700"
+    begin_time = "2025-01-01"
     end_time = None
-    data_src_type = DATA_SRC.BAO_STOCK
-    lv_list = [KL_TYPE.K_5M]
+    data_src_type = DATA_SRC.FUTU
+    lv_list = [KL_TYPE.K_DAY]
 
     config = CChanConfig({
         "trigger_step": True,
-        "divergence_rate": 0.8,
+        "divergence_rate": 0.9,
         "min_zs_cnt": 1,
     })
 
@@ -35,13 +36,13 @@ if __name__ == "__main__":
         config=config,
         autype=AUTYPE.QFQ,  # 已经没啥用了这一行
     )
-    CBaoStock.do_init()
-    data_src = CBaoStock(code, k_type=KL_TYPE.K_5M, begin_date=begin_time, end_date=end_time, autype=AUTYPE.QFQ)  # 初始化数据源类
+    CFutu.do_init()
+    data_src = CFutu(code, k_type=KL_TYPE.K_DAY, begin_date=begin_time, end_date=end_time, autype=AUTYPE.QFQ)  # 初始化数据源类
 
     is_hold = False
     last_buy_price = None
     for klu in data_src.get_kl_data():  # 获取单根K线
-        chan.trigger_load({KL_TYPE.K_5M: [klu]})  # 喂给CChan新增k线
+        chan.trigger_load({KL_TYPE.K_DAY: [klu]})  # 喂给CChan新增k线
         bsp_list = chan.get_latest_bsp()
         if not bsp_list:
             continue
@@ -60,4 +61,4 @@ if __name__ == "__main__":
             sell_price = cur_lv_chan[-1][-1].close
             print(f'{cur_lv_chan[-1][-1].time}:sell price = {sell_price},sell type={last_bsp.type[0]}, profit rate = {(sell_price-last_buy_price)/last_buy_price*100:.2f}%')
             is_hold = False
-    CBaoStock.do_close()
+    CFutu.do_close()
